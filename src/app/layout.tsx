@@ -2,8 +2,9 @@ import React from 'react';
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ToastContainer } from 'react-toastify';
-import { AwsProvider, useAws } from '@/contexts/AwsContext';
-import CorsProxyHandler from '@/components/CorsProxyHandler';
+import { AwsProvider } from '@/contexts/AwsContext';
+import CorsHandlerClient from '@/components/CorsHandlerClient';
+
 import 'react-toastify/dist/ReactToastify.css';
 import "./globals.css";
 
@@ -22,18 +23,6 @@ export const metadata: Metadata = {
   description: "A modern UI for managing AWS S3 buckets",
 };
 
-// Wrapper that adds CORS handling when authenticated
-function CorsHandler({ children }: { children: React.ReactNode }) {
-  const { setCorsHandlerInitialized, isAuthenticated } = useAws();
-
-  return (
-    <>
-      {isAuthenticated && <CorsProxyHandler onInitialized={() => setCorsHandlerInitialized(true)} />}
-      {children}
-    </>
-  );
-}
-
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -43,10 +32,10 @@ export default function RootLayout({
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <AwsProvider>
-          <CorsHandler>
+          <CorsHandlerClient>
             <ToastContainer position="top-right" autoClose={3000} />
             {children}
-          </CorsHandler>
+          </CorsHandlerClient>
         </AwsProvider>
       </body>
     </html>

@@ -38,11 +38,34 @@ export default function AuthPage() {
         AWS.config.update({
             httpOptions: {
                 xhrAsync: true,
-                xhrWithCredentials: false // Ensures no cookies are sent in CORS requests
+                xhrWithCredentials: false, // Ensures no cookies are sent in CORS requests
+                timeout: 60000  // Longer timeout for potentially slow connections
             },
             // The following helps with CORS preflight requests
             customUserAgent: 'Mozilla/5.0 S3BucketManager'
         });
+
+        // Add global handler for AWS HTTP requests
+        try {
+            // Using type assertion since AWS.util and HttpClient are not directly exposed in TypeScript
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const AWSAny = AWS as any;
+
+            // Register a global event listener if available
+            if (AWSAny.events) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                AWSAny.events.on('build', function (req: any) {
+                    console.log('Applying CORS-friendly headers to AWS request');
+                    // Add CORS friendly headers to all requests
+                    if (req.httpRequest && req.httpRequest.headers) {
+                        req.httpRequest.headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
+                        req.httpRequest.headers['Content-Type'] = 'application/json';
+                    }
+                });
+            }
+        } catch (error) {
+            console.warn('Could not attach global event handler:', error);
+        }
 
         // Apply direct patch to the S3 client prototype for listBuckets
         const originalS3 = AWS.S3;
@@ -50,7 +73,14 @@ export default function AuthPage() {
         // This will be called when the S3 client is instantiated
         // @ts-expect-error - We need to monkey patch AWS SDK
         AWS.S3 = function (options) {
-            const s3 = new originalS3(options);
+            // Create a new S3 instance with modified options to handle CORS better
+            const modifiedOptions = {
+                ...options,
+                s3ForcePathStyle: true,  // Use path style which can be more CORS-friendly
+                signatureVersion: 'v4'
+            };
+
+            const s3 = new originalS3(modifiedOptions);
 
             // Save the original listBuckets method
             const originalListBuckets = s3.listBuckets;
@@ -59,12 +89,24 @@ export default function AuthPage() {
             s3.listBuckets = function () {
                 console.log('Using direct CORS-enhanced listBuckets');
                 const request = originalListBuckets.call(this);
+                console.log('request type:', typeof request, request);
 
-                // Add headers to prevent CORS issues
-                request.on('build', function () {
+                // Check if request has the 'on' method before trying to use it
+                if (request && typeof request.on === 'function') {
+                    // Add headers to prevent CORS issues
+                    request.on('build', function () {
+                        if (request.httpRequest) {
+                            request.httpRequest.headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
+                            request.httpRequest.headers['Content-Type'] = 'application/json';
+                        }
+                    });
+                } else if (request && request.httpRequest) {
+                    // Direct modification if .on() is not available
                     request.httpRequest.headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
                     request.httpRequest.headers['Content-Type'] = 'application/json';
-                });
+                } else {
+                    console.log('Cannot modify request headers - unexpected request format:', request);
+                }
 
                 return request;
             };

@@ -65,16 +65,26 @@ const CorsProxyHandler: React.FC<CorsProxyHandlerProps> = ({ onInitialized }) =>
 
                     // Create the request using the original method
                     const request = originalListBuckets.call(this);
+                    console.log('Request type in CorsProxyHandler:', typeof request);
 
-                    // Add headers that help with CORS
-                    request.on('build', function () {
-                        // Mark payload as unsigned which helps with some CORS scenarios
+                    // Add headers that help with CORS - check if .on() exists first
+                    if (request && typeof request.on === 'function') {
+                        request.on('build', function () {
+                            // Mark payload as unsigned which helps with some CORS scenarios
+                            request.httpRequest.headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
+                            // Use a simple content type to avoid preflight
+                            request.httpRequest.headers['Content-Type'] = 'application/json';
+                            // Some services work better with this header for CORS
+                            request.httpRequest.headers['Accept'] = 'application/json, text/plain, */*';
+                        });
+                    } else if (request && request.httpRequest) {
+                        // Direct modification if .on() is not available
                         request.httpRequest.headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
-                        // Use a simple content type to avoid preflight
                         request.httpRequest.headers['Content-Type'] = 'application/json';
-                        // Some services work better with this header for CORS
                         request.httpRequest.headers['Accept'] = 'application/json, text/plain, */*';
-                    });
+                    } else {
+                        console.log('Cannot modify request headers - unexpected request format:', request);
+                    }
 
                     return request;
                 };

@@ -92,16 +92,39 @@ export const AwsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 }
             });
 
-            // Try to list buckets to verify credentials
-            await initializeS3(awsCredentials);
+            // Pre-set AWS credentials globally to avoid timing issues
+            AWS.config.credentials = new AWS.Credentials({
+                accessKeyId,
+                secretAccessKey
+            });
 
-            // If successful, save credentials
+            // Try with explicit error handling
+            try {
+                // Try to list buckets to verify credentials
+                console.log('Initializing S3 with credentials...');
+                const s3 = await initializeS3(awsCredentials);
+                console.log('S3 initialized successfully');
+
+                // Manually verify connection with a listBuckets call
+                const buckets = await s3.listBuckets().promise();
+                console.log('Successfully listed buckets:', buckets.Buckets?.length || 0);
+            } catch (initError) {
+                console.error('Error during S3 initialization or bucket listing:', initError);
+
+                // Re-throw the error to be caught by the outer catch block
+                throw initError;
+            }
+
+            // If we get here, authentication was successful
+            console.log('AWS authentication successful');
+
+            // Save credentials
             setCredentials(awsCredentials);
             setRegion(selectedRegion);
             setIsReadOnly(readOnly);
             setIsAuthenticated(true);
 
-            // Save to localStorage (be careful with this in production)
+            // Save to localStorage
             localStorage.setItem('aws_credentials', JSON.stringify(awsCredentials));
             localStorage.setItem('aws_readonly', String(readOnly));
 
@@ -118,11 +141,25 @@ export const AwsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             console.error('AWS authentication failed', error);
 
             // Provide more helpful error for CORS issues
-            if (error instanceof Error &&
-                (error.message.includes('CORS') ||
-                    error.message.includes('NetworkError') ||
-                    error.message.includes('Failed to fetch'))) {
-                throw new Error(`CORS error: Your browser is blocking cross-origin requests to AWS. Try using Chrome or Firefox.`);
+            if (error instanceof Error) {
+                const errorMsg = error.message.toLowerCase();
+
+                if (errorMsg.includes('cors') ||
+                    errorMsg.includes('networkerror') ||
+                    errorMsg.includes('failed to fetch') ||
+                    errorMsg.includes('network request failed')) {
+                    throw new Error(`CORS error: Your browser is blocking cross-origin requests to AWS. Try using Chrome or Firefox, or check your network connection.`);
+                }
+
+                if (errorMsg.includes('invalid signature') ||
+                    errorMsg.includes('credentials') ||
+                    errorMsg.includes('access key')) {
+                    throw new Error(`Authentication failed: Please verify your access key and secret key are correct.`);
+                }
+
+                if (errorMsg.includes('accessdenied') || errorMsg.includes('forbidden')) {
+                    throw new Error(`Access Denied: Your AWS user doesn't have sufficient permissions to list S3 buckets.`);
+                }
             }
 
             throw error;

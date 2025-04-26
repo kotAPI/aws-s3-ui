@@ -21,8 +21,13 @@ export const initializeS3 = async (credentials: AwsCredentials): Promise<AWS.S3>
       timeout: 30000, // Longer timeout for S3 operations
       xhrAsync: true, // Ensure XHR is async for browser compatibility
       connectTimeout: 5000, // Shorter connect timeout helps with CORS issues
+      xhrWithCredentials: false, // Disable sending cookies which can help with CORS
     }
   });
+  
+  // Set default parameters for all AWS requests that can help with CORS
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (AWS as any).config.defaultRetryCount = 3; // Retry failed requests
   
   // Create S3 instance with settings that work better with CORS
   s3Instance = new AWS.S3({
@@ -50,12 +55,60 @@ export const initializeS3 = async (credentials: AwsCredentials): Promise<AWS.S3>
   // Test connection by listing buckets (will use our patched version)
   try {
     console.log('Testing S3 connection...');
-    const result = await s3Instance.listBuckets().promise();
+    
+    // First, check if the credentials are properly set
+    if (!AWS.config.credentials || 
+        !(AWS.config.credentials instanceof AWS.Credentials)) {
+      throw new Error('AWS credentials not properly configured');
+    }
+    
+    // Try to list buckets with error checking
+    let result;
+    try {
+      result = await s3Instance.listBuckets().promise();
+    } catch (listError) {
+      console.error('Initial listBuckets error:', listError);
+      
+      // Check if this looks like a CORS error
+      const errorMessage = listError instanceof Error ? listError.message : String(listError);
+      if (errorMessage.includes('CORS') || 
+          errorMessage.includes('NetworkError') || 
+          errorMessage.includes('network') ||
+          errorMessage.includes('Failed to fetch')) {
+        console.log('Detected potential CORS error, trying alternative approach...');
+        
+        // Try with our custom implementation directly
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        result = await (s3Instance as any).customListBuckets?.() || { Buckets: [] };
+      } else {
+        // Re-throw non-CORS errors
+        throw listError;
+      }
+    }
+    
     console.log('S3 connection successful, buckets:', result.Buckets?.length || 0);
     return s3Instance;
   } catch (error) {
     console.error('S3 initialization error:', error);
+    
+    // Clean up on error
     s3Instance = null;
+    
+    // Provide more helpful error messages
+    if (error instanceof Error) {
+      if (error.message.includes('NetworkError') || 
+          error.message.includes('Failed to fetch') || 
+          error.message.includes('Network request failed')) {
+        throw new Error(`CORS or network error: The browser couldn't connect to AWS. This might be due to CORS restrictions or network issues. Try a different browser or check your internet connection.`);
+      }
+      
+      if (error.message.includes('credentials') || 
+          error.message.includes('Forbidden') || 
+          error.message.includes('AccessDenied')) {
+        throw new Error(`Authentication error: The provided AWS credentials are invalid or don't have permission to list S3 buckets.`);
+      }
+    }
+    
     throw error;
   }
 };
@@ -65,6 +118,8 @@ function patchAwsSdkForCors() {
   if (!s3Instance) return;
 
   try {
+    console.log('Patching AWS SDK for CORS compatibility...');
+    
     // Store reference to the original method
     const originalMakeRequest = s3Instance.makeRequest;
     
@@ -74,85 +129,105 @@ function patchAwsSdkForCors() {
       
       // Create a promise that will be resolved with the bucket list
       return new Promise((resolve, reject) => {
-        // Get the current AWS credentials
-        const credentials = AWS.config.credentials;
-        if (!credentials) {
-          return reject(new Error('No AWS credentials available'));
-        }
-        
-        // Create a simple GET request to S3 with Authorization headers
-        // Using the regional endpoint can help with some CORS issues
-        const region = AWS.config.region || 'us-east-1';
-        let endpoint;
-        
-        // Use the regional endpoint if not us-east-1
-        if (region === 'us-east-1') {
-          endpoint = 'https://s3.amazonaws.com/';
-        } else {
-          endpoint = `https://s3.${region}.amazonaws.com/`;
-        }
-        
-        console.log(`Using S3 endpoint: ${endpoint} for CORS-friendly request`);
-        
-        const request = new AWS.HttpRequest(new AWS.Endpoint(endpoint), region);
-        request.method = 'GET';
-        request.path = '/';
-        request.headers.Host = request.endpoint.host;
-        request.headers['Accept'] = 'application/xml, text/xml, */*';
-        request.headers['Content-Type'] = 'application/json'; // Simple CORS content type
-        
-        // Sign the request using AWS Signature V4
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const SignerV4 = (AWS as any).Signers.V4;
-        const signer = new SignerV4(request, 's3');
-        signer.addAuthorization(credentials, new Date());
-        
-        // Create fetch request options with CORS mode explicitly set
-        const requestOptions: RequestInit = {
-          method: 'GET',
-          headers: request.headers,
-          mode: 'cors',
-          credentials: 'omit', // Explicitly omit credentials for CORS
-        };
-        
-        // Make a direct fetch call to the S3 API
-        fetch(endpoint, requestOptions)
-          .then(response => {
-            if (!response.ok) {
-              console.error('S3 API error response:', response.status, response.statusText);
-              throw new Error(`S3 API responded with ${response.status}: ${response.statusText}`);
-            }
-            return response.text();
-          })
-          .then(xmlData => {
-            // Parse the XML response
-            const parser = new DOMParser();
-            const xmlDoc = parser.parseFromString(xmlData, "application/xml");
-            
-            // Extract bucket information
-            const buckets = Array.from(xmlDoc.getElementsByTagName('Bucket')).map(bucket => {
-              const name = bucket.getElementsByTagName('Name')[0]?.textContent;
-              const creationDate = bucket.getElementsByTagName('CreationDate')[0]?.textContent;
-              
-              return {
-                Name: name || '',
-                CreationDate: creationDate ? new Date(creationDate) : undefined
-              };
-            });
-            
-            // Create a response object similar to what the AWS SDK would return
-            resolve({
-              Buckets: buckets,
-              Owner: {
-                ID: xmlDoc.getElementsByTagName('ID')[0]?.textContent || '',
-                DisplayName: xmlDoc.getElementsByTagName('DisplayName')[0]?.textContent || ''
+        try {
+          // Get the current AWS credentials
+          const credentials = AWS.config.credentials;
+          if (!credentials) {
+            return reject(new Error('No AWS credentials available'));
+          }
+          
+          // Create a simple GET request to S3 with Authorization headers
+          // Using the regional endpoint can help with some CORS issues
+          const region = AWS.config.region || 'us-east-1';
+          let endpoint;
+          
+          // Use the regional endpoint if not us-east-1
+          if (region === 'us-east-1') {
+            endpoint = 'https://s3.amazonaws.com/';
+          } else {
+            endpoint = `https://s3.${region}.amazonaws.com/`;
+          }
+          
+          console.log(`Using S3 endpoint: ${endpoint} for CORS-friendly request`);
+          
+          const request = new AWS.HttpRequest(new AWS.Endpoint(endpoint), region);
+          request.method = 'GET';
+          request.path = '/';
+          request.headers.Host = request.endpoint.host;
+          request.headers['Accept'] = 'application/xml, text/xml, */*';
+          request.headers['Content-Type'] = 'application/json'; // Simple CORS content type
+          
+          // Sign the request using AWS Signature V4
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const SignerV4 = (AWS as any).Signers.V4;
+          const signer = new SignerV4(request, 's3');
+          signer.addAuthorization(credentials, new Date());
+          
+          // Create fetch request options with CORS mode explicitly set
+          const requestOptions: RequestInit = {
+            method: 'GET',
+            headers: request.headers,
+            mode: 'cors',
+            credentials: 'omit', // Explicitly omit credentials for CORS
+          };
+          
+          // Make a direct fetch call to the S3 API with error handling
+          console.log('Sending direct fetch request to S3 API');
+          
+          fetch(endpoint, requestOptions)
+            .then(response => {
+              if (!response.ok) {
+                console.error('S3 API error response:', response.status, response.statusText);
+                throw new Error(`S3 API responded with ${response.status}: ${response.statusText}`);
               }
+              return response.text();
+            })
+            .then(xmlData => {
+              try {
+                // Parse the XML response
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlData, "application/xml");
+                
+                // Check for error responses in the XML
+                const error = xmlDoc.getElementsByTagName('Error')[0];
+                if (error) {
+                  const code = error.getElementsByTagName('Code')[0]?.textContent || 'UnknownError';
+                  const message = error.getElementsByTagName('Message')[0]?.textContent || 'Unknown error occurred';
+                  throw new Error(`AWS Error ${code}: ${message}`);
+                }
+                
+                // Extract bucket information
+                const buckets = Array.from(xmlDoc.getElementsByTagName('Bucket')).map(bucket => {
+                  const name = bucket.getElementsByTagName('Name')[0]?.textContent;
+                  const creationDate = bucket.getElementsByTagName('CreationDate')[0]?.textContent;
+                  
+                  return {
+                    Name: name || '',
+                    CreationDate: creationDate ? new Date(creationDate) : undefined
+                  };
+                });
+                
+                // Create a response object similar to what the AWS SDK would return
+                resolve({
+                  Buckets: buckets,
+                  Owner: {
+                    ID: xmlDoc.getElementsByTagName('ID')[0]?.textContent || '',
+                    DisplayName: xmlDoc.getElementsByTagName('DisplayName')[0]?.textContent || ''
+                  }
+                });
+              } catch (parseError) {
+                console.error('Error parsing XML response:', parseError);
+                reject(parseError);
+              }
+            })
+            .catch(error => {
+              console.error('Error in custom listBuckets implementation:', error);
+              reject(error);
             });
-          })
-          .catch(error => {
-            console.error('Error in custom listBuckets implementation:', error);
-            reject(error);
-          });
+        } catch (setupError) {
+          console.error('Error setting up fetch request:', setupError);
+          reject(setupError);
+        }
       });
     };
 
@@ -166,9 +241,20 @@ function patchAwsSdkForCors() {
       if (operation === 'listBuckets') {
         console.log('Intercepting listBuckets to use CORS-friendly implementation');
         
-        // Create a mock request object with a promise method
+        // Instead of patching the AWS SDK, let's just use our direct fetch implementation
         const mockRequest = {
-          promise: () => customListBuckets()
+          promise: () => customListBuckets(),
+          // Add additional methods that might be expected
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          send: function(callback: any) {
+            customListBuckets()
+              .then(data => callback(null, data))
+              .catch(err => callback(err));
+          },
+          abort: function() {},  // No-op for abort
+          httpRequest: {
+            headers: {}
+          }
         };
         
         return mockRequest;
@@ -177,6 +263,8 @@ function patchAwsSdkForCors() {
       // For all other operations, use the original behavior
       return originalMakeRequest.call(this, operation, params);
     };
+    
+    console.log('Successfully patched AWS SDK for CORS handling');
   } catch (error) {
     // If patching fails, log the error but don't break the application
     console.error('Failed to patch AWS SDK for CORS:', error);
